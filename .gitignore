@@ -1,0 +1,47 @@
+# ==== Ignore node modules ====
+node_modules/
+**/node_modules/
+
+# ==== Editor / IDE ====
+.vscode/
+*.code-workspace
+
+# ==== Ambiente / variáveis secretas ====
+**/.env
+.env
+.env.*
+
+# ==== Supabase local arquivos temporários / cache ====
+supabase/.temp/
+supabase/.branches/
+
+# ==== Arquivos de build, saída, transpilados ====
+dist/
+build/
+*.js
+*.js.map
+*.d.ts
+*.wasm
+
+# ==== Lockfiles ====
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# ==== Logs ====
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ==== OS / sistema / arquivos temporários ====
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ==== Outros arquivos pessoais / temporários ====
+*.local
+cache/
+temp/
+.tmp/
