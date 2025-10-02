@@ -42,8 +42,14 @@ interface RequestGraph {
   params?: Record<string, unknown>;
 }
 
+interface RequestTable {
+  slug: string;
+  params?: Record<string, unknown>;
+}
+
 interface RequestBody {
   graphs?: RequestGraph[];
+  tables?: RequestTable[];
 }
 
 interface GraphResponse {
@@ -58,6 +64,45 @@ interface GraphResponse {
 }
 
 type DatasetMap = Record<number, Record<string, unknown>[]>;
+
+interface TableColumnConfig {
+  key: string;
+  label: string;
+  type?: "string" | "number" | "date" | "boolean";
+  is_toggle?: boolean;
+  align?: "left" | "center" | "right";
+  width?: string;
+  hidden?: boolean;
+}
+
+interface TableRecord {
+  id: number;
+  slug: string;
+  title: string | null;
+  description: string | null;
+  query_template: string;
+  column_config: TableColumnConfig[];
+  param_schema: ParamSchema | null;
+  default_params: Record<string, unknown> | null;
+  result_shape: Record<string, unknown> | null;
+  allowed_roles: string[] | string | null;
+  primary_key: string | null;
+  is_active: boolean | null;
+}
+
+interface TableResponse {
+  id: number;
+  slug: string;
+  title: string | null;
+  description: string | null;
+  columns: TableColumnConfig[];
+  primary_key: string | null;
+  param_schema: ParamSchema | null;
+  default_params: Record<string, unknown> | null;
+  result_shape: Record<string, unknown> | null;
+}
+
+type TableRowsMap = Record<number, Record<string, unknown>[]>;
 
 const DATE_ONLY_FORMAT = /^(\d{4})-(\d{2})-(\d{2})$/;
 
@@ -513,6 +558,115 @@ function normalizeGraphRecord(row: Record<string, unknown>): GraphRecord {
   };
 }
 
+function normalizeTableColumns(value: unknown): TableColumnConfig[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item !== "object" || item === null) {
+          return null;
+        }
+        const entry = item as Record<string, unknown>;
+        const key = typeof entry.key === "string" && entry.key.trim() !== "" ? entry.key.trim() : null;
+        const label = typeof entry.label === "string" && entry.label.trim() !== "" ? entry.label.trim() : key;
+        if (!key || !label) {
+          return null;
+        }
+        const normalized: TableColumnConfig = {
+          key,
+          label,
+        };
+
+        if (typeof entry.type === "string") {
+          const possible = entry.type.toLowerCase() as TableColumnConfig["type"];
+          if (["string", "number", "date", "boolean"].includes(possible ?? "")) {
+            normalized.type = possible;
+          }
+        }
+
+        if (typeof entry.is_toggle === "boolean") {
+          normalized.is_toggle = entry.is_toggle;
+        }
+
+        if (typeof entry.align === "string") {
+          const align = entry.align.toLowerCase();
+          if (["left", "center", "right"].includes(align)) {
+            normalized.align = align as TableColumnConfig["align"];
+          }
+        }
+
+        if (typeof entry.width === "string") {
+          normalized.width = entry.width;
+        }
+
+        if (typeof entry.hidden === "boolean") {
+          normalized.hidden = entry.hidden;
+        }
+
+        return normalized;
+      })
+      .filter((item): item is TableColumnConfig => item !== null);
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = safeJsonParse<TableColumnConfig[]>(value);
+    if (parsed) {
+      return normalizeTableColumns(parsed);
+    }
+  }
+
+  return [];
+}
+
+function normalizeTableRecord(row: Record<string, unknown>): TableRecord {
+  const columnConfig = normalizeTableColumns(row.column_config);
+
+  const paramSchema = safeJsonParse<ParamSchema>(row.param_schema) ?? (typeof row.param_schema === "object" && row.param_schema !== null
+    ? (row.param_schema as ParamSchema)
+    : null);
+
+  const defaultParams = safeJsonParse<Record<string, unknown>>(row.default_params) ?? (typeof row.default_params === "object" && row.default_params !== null
+    ? (row.default_params as Record<string, unknown>)
+    : null);
+
+  const resultShape = safeJsonParse<Record<string, unknown>>(row.result_shape) ?? (typeof row.result_shape === "object" && row.result_shape !== null
+    ? (row.result_shape as Record<string, unknown>)
+    : null);
+
+  let allowedRoles: TableRecord["allowed_roles"] = null;
+  if (Array.isArray(row.allowed_roles)) {
+    allowedRoles = row.allowed_roles as string[];
+  } else if (typeof row.allowed_roles === "string") {
+    allowedRoles = row.allowed_roles;
+  }
+
+  const isActiveValue = row.is_active;
+  let isActive: boolean | null = null;
+  if (typeof isActiveValue === "boolean") {
+    isActive = isActiveValue;
+  } else if (typeof isActiveValue === "number") {
+    isActive = isActiveValue !== 0;
+  }
+
+  const primaryKey = typeof row.primary_key === "string" && row.primary_key.trim() !== ""
+    ? row.primary_key.trim()
+    : null;
+
+  return {
+    id: typeof row.id === "number" ? row.id : Number(row.id),
+    slug: String(row.slug ?? ""),
+    title: row.title === null || row.title === undefined ? null : String(row.title),
+    description: row.description === null || row.description === undefined ? null : String(row.description),
+    query_template: String(row.query_template ?? ""),
+    column_config: columnConfig,
+    param_schema: paramSchema,
+    default_params: defaultParams,
+    result_shape: resultShape,
+    allowed_roles: allowedRoles,
+    primary_key: primaryKey,
+    is_active: isActive,
+  };
+}
+
 serve(async (req: Request) => {
   // CORS headers comuns
   const corsHeaders = {
@@ -620,6 +774,15 @@ serve(async (req: Request) => {
         }
       }
 
+      const requestedTables = Array.isArray(requestBody.tables) ? requestBody.tables : null;
+      const requestedTableSlugs = requestedTables?.map((table) => table.slug).filter(Boolean) ?? [];
+      const providedTableParams = new Map<string, Record<string, unknown>>();
+      for (const table of requestedTables ?? []) {
+        if (table.slug) {
+          providedTableParams.set(table.slug, table.params ?? {});
+        }
+      }
+
       const userRoles = extractUserRoles(userAuth.user);
 
       const queryArgs: unknown[] = [];
@@ -635,7 +798,7 @@ serve(async (req: Request) => {
           result_shape,
           allowed_roles,
           is_active
-        FROM graficos
+  FROM graficos_dashboard
         WHERE is_active IS DISTINCT FROM FALSE
       `;
 
@@ -648,10 +811,15 @@ serve(async (req: Request) => {
 
       const resultGraphics = await client.queryObject<Record<string, unknown>>({ text: baseQuery, args: queryArgs });
 
-  const datasets: DatasetMap = {};
-  const debug: Record<number, unknown> = {};
-  const errors: Record<string, unknown> = {};
-  const graphics: GraphResponse[] = [];
+      const datasets: DatasetMap = {};
+      const debug: Record<number, unknown> = {};
+      const errors: Record<string, unknown> = {};
+      const graphics: GraphResponse[] = [];
+
+      const tableRows: TableRowsMap = {};
+      const tableDebug: Record<number, unknown> = {};
+      const tableErrors: Record<string, unknown> = {};
+      const tables: TableResponse[] = [];
 
       const returnedSlugs = new Set<string>();
 
@@ -719,6 +887,265 @@ serve(async (req: Request) => {
         });
       }
 
+      const tableReturnedSlugs = new Set<string>();
+      const shouldIncludeBaseTable = requestedTableSlugs.length === 0 || requestedTableSlugs.includes("clientes");
+
+      if (shouldIncludeBaseTable) {
+        const baseTableId = 0;
+        const baseTableSlug = "clientes";
+        const baseColumns: TableColumnConfig[] = [
+          { key: "nome_recebido", label: "Nome", type: "string" },
+          { key: "whatsapp", label: "WhatsApp", type: "string" },
+          { key: "created_at_exibicao", label: "Criado em", type: "string" },
+          { key: "ultimo_acesso_exibicao", label: "Último acesso", type: "string" },
+          { key: "paused", label: "Atendimento Alfred", type: "boolean", is_toggle: true, align: "center", width: "160px" },
+        ];
+
+        let hasUltimoAcessoColumn = false;
+        try {
+          const ultimoAcessoColumnResult = await client.queryObject<{ exists: boolean }>({
+            text: `
+              SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'clientes'
+                  AND column_name = 'ultimo_acesso'
+              ) AS exists
+            `,
+          });
+          hasUltimoAcessoColumn = Boolean(ultimoAcessoColumnResult.rows[0]?.exists);
+        } catch (checkUltimoAcessoError) {
+          console.warn("Não foi possível verificar existência da coluna ultimo_acesso", checkUltimoAcessoError);
+        }
+
+        const ultimoAcessoDisplaySelect = hasUltimoAcessoColumn
+          ? "to_char(ultimo_acesso AT TIME ZONE 'UTC', 'DD/MM/YYYY') AS ultimo_acesso_exibicao"
+          : "NULL::text AS ultimo_acesso_exibicao";
+
+        const dataReferenciaSelect = hasUltimoAcessoColumn
+          ? "ultimo_acesso AS data_referencia"
+          : "created_at AS data_referencia";
+
+        const ultimoAcessoWhereClauses = hasUltimoAcessoColumn
+          ? [
+              "ultimo_acesso IS NOT NULL",
+              "ultimo_acesso >= (NOW() - INTERVAL '7 days')",
+            ]
+          : [
+              "created_at >= (NOW() - INTERVAL '7 days')",
+            ];
+
+        const baseWhereClauses = [
+          ...ultimoAcessoWhereClauses,
+          "nome_recebido IS NOT NULL",
+          "TRIM(nome_recebido) <> ''",
+          "(whatsapp IS NULL OR whatsapp NOT ILIKE '%@g.us%')",
+        ];
+
+        const baseQueryWhere = baseWhereClauses.length > 0
+          ? `WHERE ${baseWhereClauses.join("\n              AND ")}`
+          : "";
+
+        const baseQueryOrderBy = " ORDER BY data_referencia DESC NULLS LAST";
+
+        const baseQueryText = `
+          WITH clientes_filtrados AS (
+            SELECT
+              id,
+              TRIM(nome_recebido) AS nome_recebido,
+              whatsapp,
+              created_at,
+              ${dataReferenciaSelect},
+              to_char(created_at AT TIME ZONE 'UTC', 'DD/MM/YYYY') AS created_at_exibicao,
+              ${ultimoAcessoDisplaySelect},
+              paused,
+              REGEXP_REPLACE(
+                REGEXP_REPLACE(COALESCE(whatsapp, ''), '@.*$', ''),
+                '\\D',
+                '',
+                'g'
+              ) AS whatsapp_digits
+            FROM clientes
+            ${baseQueryWhere}
+          )
+          SELECT
+            id,
+            nome_recebido,
+            whatsapp,
+            whatsapp_digits,
+            created_at_exibicao,
+            ultimo_acesso_exibicao,
+            paused
+          FROM clientes_filtrados
+          WHERE COALESCE(whatsapp_digits, '') <> ''
+        `;
+
+        try {
+          const baseQueryResult = await client.queryObject<Record<string, unknown>>({
+            text: baseQueryText + baseQueryOrderBy,
+          });
+          const enhancedRows = baseQueryResult.rows.map((row) => {
+            const normalized = sanitizeRowForJson(row);
+            const digits = typeof normalized.whatsapp_digits === "string" ? normalized.whatsapp_digits.trim() : "";
+            if (digits) {
+              normalized.whatsapp = digits;
+            }
+            delete normalized.whatsapp_digits;
+            return normalized;
+          });
+          tableRows[baseTableId] = enhancedRows;
+          tableDebug[baseTableId] = {
+            slug: baseTableSlug,
+            query: baseQueryText + baseQueryOrderBy,
+            rowCount: baseQueryResult.rows.length,
+            sample: enhancedRows.slice(0, 5),
+            notes: hasUltimoAcessoColumn ? undefined : "Coluna ultimo_acesso ausente; aplicando fallback para created_at.",
+          };
+        } catch (baseTableError) {
+          tableErrors[baseTableSlug] = (baseTableError as Error).message;
+        }
+
+        const baseTable: TableResponse = {
+          id: baseTableId,
+          slug: baseTableSlug,
+          title: "Clientes",
+          description: "Usuários ativos nos últimos 7 dias",
+          columns: baseColumns,
+          primary_key: "id",
+          param_schema: null,
+          default_params: null,
+          result_shape: null,
+        };
+
+        tables.push(baseTable);
+        tableReturnedSlugs.add(baseTableSlug);
+      }
+
+      const filteredTableSlugs = requestedTableSlugs.filter((slug) => slug !== "clientes");
+      let hasDashboardTables = false;
+      try {
+        const existsResult = await client.queryObject<{ exists: boolean }>({
+          text: "SELECT to_regclass('public.dashboard_tables') IS NOT NULL AS exists",
+        });
+        hasDashboardTables = Boolean(existsResult.rows[0]?.exists);
+      } catch (checkError) {
+        console.warn("Não foi possível verificar existência de dashboard_tables", checkError);
+      }
+
+      if (hasDashboardTables) {
+        const tableQueryArgs: unknown[] = [];
+        let tableQuery = `
+          SELECT
+            id,
+            slug,
+            title,
+            description,
+            query_template,
+            column_config,
+            param_schema,
+            default_params,
+            result_shape,
+            allowed_roles,
+            primary_key,
+            is_active
+          FROM dashboard_tables
+          WHERE is_active IS DISTINCT FROM FALSE
+        `;
+
+        if (filteredTableSlugs.length > 0) {
+          tableQueryArgs.push(filteredTableSlugs);
+          tableQuery += ` AND slug = ANY($${tableQueryArgs.length}::text[])`;
+        }
+
+        tableQuery += " ORDER BY id";
+
+        try {
+          const tableResults = await client.queryObject<Record<string, unknown>>({ text: tableQuery, args: tableQueryArgs });
+          for (const row of tableResults.rows) {
+            const tableRecord = normalizeTableRecord(row);
+            tableReturnedSlugs.add(tableRecord.slug);
+
+            if (!tableRecord.query_template || tableRecord.query_template.trim() === "") {
+              tableErrors[tableRecord.slug] = "Query template vazio.";
+              continue;
+            }
+
+            const allowedRoles = normalizeAllowedRoles(tableRecord.allowed_roles);
+            if (allowedRoles.length > 0 && !allowedRoles.some((role) => userRoles.includes(role))) {
+              tableErrors[tableRecord.slug] = "Usuário não possui permissão para esta tabela.";
+              continue;
+            }
+
+            const schema = tableRecord.param_schema ?? {};
+            const defaults = tableRecord.default_params ?? {};
+            const providedTableParamsEntry = providedTableParams.get(tableRecord.slug);
+
+            let resolvedParams: Record<string, unknown> = {};
+            try {
+              resolvedParams = resolveParams(schema, defaults, providedTableParamsEntry);
+            } catch (paramError) {
+              tableErrors[tableRecord.slug] = (paramError as Error).message;
+              continue;
+            }
+
+            let sql: { text: string; args: unknown[] };
+            try {
+              sql = buildParameterizedQuery(tableRecord.query_template, resolvedParams, tableRecord.param_schema ?? {});
+            } catch (templateError) {
+              tableErrors[tableRecord.slug] = (templateError as Error).message;
+              continue;
+            }
+
+            try {
+              const queryResult = await client.queryObject<Record<string, unknown>>(sql);
+              const normalizedRows = queryResult.rows.map((row) => sanitizeRowForJson(row));
+              tableRows[tableRecord.id] = normalizedRows;
+              tableDebug[tableRecord.id] = {
+                slug: tableRecord.slug,
+                params: resolvedParams,
+                query: sql.text,
+                args: sql.args,
+                rowCount: queryResult.rows.length,
+                sample: normalizedRows.slice(0, 5),
+              };
+            } catch (tableQueryError) {
+              tableErrors[tableRecord.slug] = (tableQueryError as Error).message;
+              continue;
+            }
+
+            tables.push({
+              id: tableRecord.id,
+              slug: tableRecord.slug,
+              title: tableRecord.title,
+              description: tableRecord.description,
+              columns: tableRecord.column_config,
+              primary_key: tableRecord.primary_key,
+              param_schema: tableRecord.param_schema,
+              default_params: tableRecord.default_params,
+              result_shape: tableRecord.result_shape,
+            });
+          }
+        } catch (tableMetadataError) {
+          tableErrors["__metadata"] = (tableMetadataError as Error).message;
+        }
+      } else if (filteredTableSlugs.length > 0) {
+        for (const slug of filteredTableSlugs) {
+          tableErrors[slug] = "Tabela personalizada indisponível: metadados não foram provisionados.";
+        }
+      }
+
+      if (requestedTableSlugs.length > 0) {
+        for (const slug of requestedTableSlugs) {
+          if (slug === "clientes" && shouldIncludeBaseTable) {
+            continue;
+          }
+          if (!tableReturnedSlugs.has(slug)) {
+            tableErrors[slug] = "Tabela não encontrada ou inativa.";
+          }
+        }
+      }
+
       if (requestedSlugs.length > 0) {
         for (const slug of requestedSlugs) {
           if (!returnedSlugs.has(slug)) {
@@ -733,6 +1160,10 @@ serve(async (req: Request) => {
         datasets,
         debug,
         errors,
+        tables,
+        tableRows,
+        tableDebug,
+        tableErrors,
       };
 
       return new Response(JSON.stringify(responsePayload), {

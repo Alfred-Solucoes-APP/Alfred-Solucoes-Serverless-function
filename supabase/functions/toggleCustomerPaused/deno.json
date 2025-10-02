@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "supabase": "npm:@supabase/supabase-js@2",
+    "postgres": "https://deno.land/x/postgres@v0.17.0/mod.ts",
+    "std/http": "https://deno.land/std@0.177.0/http/server.ts"
+  }
+}

@@ -238,7 +238,7 @@ serve(async (req: Request) => {
     try {
       const existing = await client.queryObject<{ id: number }>(
         {
-          text: "SELECT id FROM graficos WHERE slug = $1",
+          text: "SELECT id FROM graficos_dashboard WHERE slug = $1",
           args: [slug],
         },
       );
@@ -253,7 +253,7 @@ serve(async (req: Request) => {
       const insertResult = await client.queryObject<{ id: number }>(
         {
           text: `
-            INSERT INTO graficos (
+            INSERT INTO graficos_dashboard (
               slug,
               title,
               description,
