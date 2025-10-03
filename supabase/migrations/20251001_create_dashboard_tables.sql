@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS dashboard_tables (
     description   TEXT,
     query_template TEXT NOT NULL,
     column_config  JSONB NOT NULL DEFAULT '[]'::jsonb,
-    param_schema   JSONB,
+    param_schema   JSONB,5
     default_params JSONB,
     result_shape   JSONB,
     allowed_roles  TEXT[] DEFAULT ARRAY['user'],

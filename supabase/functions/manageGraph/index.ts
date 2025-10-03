@@ -1,8 +1,23 @@
 import { serve } from "std/http";
-import { createClient } from "supabase";
 import { Pool } from "postgres";
-
-type JsonRecord = Record<string, unknown>;
+import {
+  buildCorsHeaders,
+  handlePreflight,
+  methodNotAllowed,
+  unauthorized,
+  forbidden,
+  conflict,
+  jsonResponse,
+  serverError,
+  badRequest,
+  requireAdminUser,
+  parseJsonObjectField,
+  parseAllowedRoles,
+  normalizeSlug,
+  ensureNonEmptyString,
+  getCompanyConnection,
+  logger,
+} from "../_shared/mod.ts";
 
 type GraphPayload = {
   company_id: string;
@@ -17,213 +32,56 @@ type GraphPayload = {
   is_active?: boolean;
 };
 
-type DbInfoRow = {
-  db_host: string;
-  db_name: string;
-  db_user: string;
-  db_password: string;
-  company_name: string | null;
-};
-
-function parseJsonField(value: unknown, fieldName: string): JsonRecord | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as JsonRecord;
-      }
-      throw new Error("O JSON deve representar um objeto.");
-    } catch (error) {
-      throw new Error(`Campo '${fieldName}' não contém um JSON válido: ${(error as Error).message}`);
-    }
-  }
-
-  if (typeof value === "object" && !Array.isArray(value)) {
-    return value as JsonRecord;
-  }
-
-  throw new Error(`Campo '${fieldName}' deve ser um objeto JSON.`);
-}
-
-function parseAllowedRoles(value: unknown): string[] {
-  const fallbackRoles = ["user", "authenticated"];
-
-  const normalizeRoles = (roles: string[]): string[] => {
-    const unique = new Set<string>();
-    for (const role of roles) {
-      const trimmed = role.trim();
-      if (trimmed.length > 0) {
-        unique.add(trimmed);
-      }
-    }
-
-    if (unique.size === 0) {
-      for (const fallback of fallbackRoles) {
-        unique.add(fallback);
-      }
-    }
-
-    return Array.from(unique);
-  };
-
-  if (value === null || value === undefined || value === "") {
-    return [...fallbackRoles];
-  }
-
-  if (Array.isArray(value)) {
-    const roles = value.map((item) => (typeof item === "string" ? item : String(item)));
-    return normalizeRoles(roles);
-  }
-
-  if (typeof value === "string") {
-    return normalizeRoles(value.split(","));
-  }
-
-  return normalizeRoles([String(value)]);
-}
-
-function normalizeSlug(slug: string): string {
-  const trimmed = slug.trim();
-  if (!trimmed) {
-    throw new Error("Slug do gráfico é obrigatório.");
-  }
-  return trimmed.toLowerCase().replace(/\s+/g, "_");
-}
-
-function ensureQueryTemplate(template: string): string {
-  const normalized = template.trim();
-  if (!normalized) {
-    throw new Error("Query template é obrigatório.");
-  }
-  return normalized;
-}
-
-async function requireAdminUser(token: string) {
-  const supabaseClient = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-    {
-      global: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-    }
-  );
-
-  const { data, error } = await supabaseClient.auth.getUser(token);
-  if (error || !data.user) {
-    throw new Error("Usuário não autenticado ou inválido.");
-  }
-
-  const roleSources = [
-    data.user.app_metadata?.role,
-    data.user.user_metadata?.role,
-    data.user.app_metadata?.roles,
-    data.user.user_metadata?.roles,
-  ];
-
-  const roles = new Set<string>(["authenticated"]);
-  for (const source of roleSources) {
-    if (!source) continue;
-    if (typeof source === "string") {
-      roles.add(source);
-    } else if (Array.isArray(source)) {
-      for (const item of source) {
-        if (typeof item === "string") {
-          roles.add(item);
-        }
-      }
-    }
-  }
-
-  if (!roles.has("admin")) {
-    throw new Error("Acesso negado. Apenas administradores podem gerenciar gráficos.");
-  }
-
-  return data.user;
-}
-
-async function getCompanyConnection(companyId: string): Promise<DbInfoRow> {
-  const supabaseService = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-  );
-
-  const { data, error } = await supabaseService
-    .from("db_info")
-    .select("db_host, db_name, db_user, db_password, company_name")
-    .eq("id_user", companyId)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(error.message ?? "Erro ao buscar banco do cliente.");
-  }
-
-  if (!data) {
-    throw new Error("Nenhum banco encontrado para o cliente informado.");
-  }
-
-  return data as DbInfoRow;
-}
+const ACTION_LABEL = "gerenciar gráficos";
 
 serve(async (req: Request) => {
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": Deno.env.get("FUNCTIONS_ALLOWED_ORIGIN") ?? "*",
-    "Access-Control-Allow-Headers":
-      "authorization, content-type, apikey, x-client-info, x-client-version",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
+  const corsHeaders = buildCorsHeaders({ methods: ["POST", "OPTIONS"] });
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders });
+  const preflight = handlePreflight(req, corsHeaders);
+  if (preflight) {
+    return preflight;
   }
 
   if (req.method !== "POST") {
-    return new Response("Method Not Allowed", {
-      status: 405,
-      headers: { ...corsHeaders, "Content-Type": "text/plain" },
-    });
+    return methodNotAllowed(corsHeaders);
   }
 
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Authorization header ausente." }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return unauthorized("Authorization header ausente.", corsHeaders);
     }
 
     const token = authHeader.substring("Bearer ".length);
-    await requireAdminUser(token);
+    try {
+      await requireAdminUser(token, { action: ACTION_LABEL });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Acesso negado.";
+      if (message.includes("não autenticado")) {
+        return unauthorized(message, corsHeaders);
+      }
+      return forbidden(message, corsHeaders);
+    }
 
     let payload: GraphPayload;
     try {
       payload = (await req.json()) as GraphPayload;
     } catch (error) {
-      return new Response(JSON.stringify({ error: "JSON inválido no corpo da requisição." }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      logger.warn("manageGraph: JSON inválido recebido", {
+        error: error instanceof Error ? error.message : String(error),
       });
+      return badRequest("JSON inválido no corpo da requisição.", corsHeaders);
     }
 
     if (!payload.company_id) {
-      return new Response(JSON.stringify({ error: "Campo company_id é obrigatório." }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return badRequest("Campo company_id é obrigatório.", corsHeaders);
     }
 
-    const slug = normalizeSlug(payload.slug ?? "");
-    const queryTemplate = ensureQueryTemplate(payload.query_template ?? "");
-    const paramSchema = parseJsonField(payload.param_schema, "param_schema");
-    const defaultParams = parseJsonField(payload.default_params, "default_params");
-    const resultShape = parseJsonField(payload.result_shape, "result_shape");
+    const slug = normalizeSlug(payload.slug ?? "", { resourceName: "gráfico", fieldLabel: "Slug" });
+    const queryTemplate = ensureNonEmptyString(payload.query_template ?? "", { fieldLabel: "Query template" });
+    const paramSchema = parseJsonObjectField(payload.param_schema, "param_schema");
+    const defaultParams = parseJsonObjectField(payload.default_params, "default_params");
+    const resultShape = parseJsonObjectField(payload.result_shape, "result_shape");
     const allowedRoles = parseAllowedRoles(payload.allowed_roles);
     const isActive = payload.is_active ?? true;
 
@@ -244,10 +102,7 @@ serve(async (req: Request) => {
       );
 
       if (existing.rows.length > 0) {
-        return new Response(JSON.stringify({ error: "Já existe um gráfico com este slug." }), {
-          status: 409,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return conflict("Já existe um gráfico com este slug.", corsHeaders);
       }
 
       const insertResult = await client.queryObject<{ id: number }>(
@@ -292,27 +147,24 @@ serve(async (req: Request) => {
 
       const insertedId = insertResult.rows[0]?.id ?? null;
 
-      return new Response(
-        JSON.stringify({
+      return jsonResponse(
+        {
           message: "Gráfico cadastrado com sucesso.",
           graph_id: insertedId,
           slug,
           company_name: companyDb.company_name,
-        }),
-        {
-          status: 201,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
         },
+        { status: 201, corsHeaders },
       );
     } finally {
       client.release();
       await pool.end();
     }
   } catch (error) {
-    console.error("Erro na função manageGraph", error);
-    return new Response(JSON.stringify({ error: (error as Error).message ?? "Erro inesperado." }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    logger.error("Erro na função manageGraph", {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
     });
+    return serverError((error as Error).message ?? "Erro inesperado.", corsHeaders);
   }
 });
