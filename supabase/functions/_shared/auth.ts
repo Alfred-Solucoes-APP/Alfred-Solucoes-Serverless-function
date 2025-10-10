@@ -1,6 +1,15 @@
 import { createClient, type User } from "supabase";
 import { logger } from "./logging.ts";
 
+export function getBearerToken(request: Request): string | null {
+	const header = request.headers.get("Authorization") ?? request.headers.get("authorization");
+	if (!header) {
+		return null;
+	}
+	const matches = header.match(/^Bearer\s+(.+)$/i);
+	return matches?.[1]?.trim() ?? null;
+}
+
 export type RequireAdminOptions = {
 	requiredRole?: string;
 	action?: string;

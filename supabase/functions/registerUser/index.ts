@@ -11,6 +11,11 @@ import {
 	serverError,
 	requireAdminUser,
 	logger,
+	applyRateLimit,
+	getBearerToken,
+	getClientIp,
+	requireApprovedDevice,
+	getClientDeviceId,
 } from "../_shared/mod.ts";
 
 type RegisterUserPayload = {
@@ -35,8 +40,24 @@ serve(async (req: Request) => {
 		return methodNotAllowed(corsHeaders);
 	}
 
-	const authHeader = req.headers.get("Authorization");
-	if (!authHeader || !authHeader.startsWith("Bearer ")) {
+	const rateLimitResponse = applyRateLimit(req, corsHeaders, {
+		identifier: "registerUser",
+		max: 10,
+		windowMs: 60_000,
+		message: "Muitas tentativas de registrar usuários. Aguarde um instante e tente novamente.",
+		keyGenerator: (request) => {
+			const ip = getClientIp(request);
+			const tokenFragment = getBearerToken(request)?.slice(-16) ?? "anon";
+			return `${ip}:${tokenFragment}`;
+		},
+	});
+
+	if (rateLimitResponse) {
+		return rateLimitResponse;
+	}
+
+	const token = getBearerToken(req);
+	if (!token) {
 		return unauthorized("Missing or invalid Authorization header", corsHeaders);
 	}
 
@@ -54,8 +75,9 @@ serve(async (req: Request) => {
 	}
 
 	try {
+		let adminUser: Awaited<ReturnType<typeof requireAdminUser>>;
 		try {
-			await requireAdminUser(authHeader.substring("Bearer ".length), { action: "registrar usuários" });
+			adminUser = await requireAdminUser(token, { action: "registrar usuários" });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "Acesso negado.";
 			if (message.includes("não autenticado")) {
@@ -64,13 +86,13 @@ serve(async (req: Request) => {
 			return forbidden(message, corsHeaders);
 		}
 
-		const supabaseClient = createClient(supabaseUrl, supabaseAnonKey, {
-			global: {
-				headers: {
-					Authorization: authHeader,
-				},
-			},
-		});
+		const clientDeviceId = getClientDeviceId(req);
+		try {
+			await requireApprovedDevice(adminUser.id, clientDeviceId);
+		} catch (deviceError) {
+			const message = deviceError instanceof Error ? deviceError.message : "Dispositivo não autorizado.";
+			return forbidden(message, corsHeaders);
+		}
 
 		let payload: RegisterUserPayload;
 		try {

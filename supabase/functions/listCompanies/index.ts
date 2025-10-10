@@ -10,6 +10,11 @@ import {
   serverError,
   requireAdminUser,
   logger,
+  applyRateLimit,
+  getBearerToken,
+  getClientIp,
+  requireApprovedDevice,
+  getClientDeviceId,
 } from "../_shared/mod.ts";
 
 type CompanyRow = {
@@ -31,19 +36,42 @@ serve(async (req: Request) => {
   }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return unauthorized("Authorization header ausente.", corsHeaders);
+    const rateLimitResponse = applyRateLimit(req, corsHeaders, {
+      identifier: "listCompanies",
+      max: 30,
+      windowMs: 60_000,
+      message: "Muitas requisições para listar empresas. Aguarde um instante e tente novamente.",
+      keyGenerator: (request) => {
+        const ip = getClientIp(request);
+        const tokenFragment = getBearerToken(request)?.slice(-16) ?? "anon";
+        return `${ip}:${tokenFragment}`;
+      },
+    });
+
+    if (rateLimitResponse) {
+      return rateLimitResponse;
     }
 
-    const token = authHeader.substring("Bearer ".length);
+    const token = getBearerToken(req);
+    if (!token) {
+      return unauthorized("Authorization header ausente.", corsHeaders);
+    }
+    let adminUser: Awaited<ReturnType<typeof requireAdminUser>>;
     try {
-      await requireAdminUser(token, { action: "listar empresas" });
+      adminUser = await requireAdminUser(token, { action: "listar empresas" });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Acesso negado.";
       if (message.includes("não autenticado")) {
         return unauthorized(message, corsHeaders);
       }
+      return forbidden(message, corsHeaders);
+    }
+
+    const clientDeviceId = getClientDeviceId(req);
+    try {
+      await requireApprovedDevice(adminUser.id, clientDeviceId);
+    } catch (deviceError) {
+      const message = deviceError instanceof Error ? deviceError.message : "Dispositivo não autorizado.";
       return forbidden(message, corsHeaders);
     }
 

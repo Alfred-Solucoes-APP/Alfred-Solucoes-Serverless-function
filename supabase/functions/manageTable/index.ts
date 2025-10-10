@@ -18,6 +18,11 @@ import {
   parsePrimaryKey,
   getCompanyConnection,
   logger,
+  applyRateLimit,
+  getBearerToken,
+  getClientIp,
+  requireApprovedDevice,
+  getClientDeviceId,
 } from "../_shared/mod.ts";
 
 type TableColumnConfig = {
@@ -130,19 +135,42 @@ serve(async (req: Request) => {
   }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return unauthorized("Authorization header ausente.", corsHeaders);
+    const rateLimitResponse = applyRateLimit(req, corsHeaders, {
+      identifier: "manageTable",
+      max: 20,
+      windowMs: 60_000,
+      message: "Muitas requisições para gerenciar tabelas. Aguarde e tente novamente.",
+      keyGenerator: (request) => {
+        const ip = getClientIp(request);
+        const tokenFragment = getBearerToken(request)?.slice(-16) ?? "anon";
+        return `${ip}:${tokenFragment}`;
+      },
+    });
+
+    if (rateLimitResponse) {
+      return rateLimitResponse;
     }
 
-    const token = authHeader.substring("Bearer ".length);
+    const token = getBearerToken(req);
+    if (!token) {
+      return unauthorized("Authorization header ausente.", corsHeaders);
+    }
+    let adminUser: Awaited<ReturnType<typeof requireAdminUser>>;
     try {
-      await requireAdminUser(token, { action: ACTION_LABEL });
+      adminUser = await requireAdminUser(token, { action: ACTION_LABEL });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Acesso negado.";
       if (message.includes("não autenticado")) {
         return unauthorized(message, corsHeaders);
       }
+      return forbidden(message, corsHeaders);
+    }
+
+    const clientDeviceId = getClientDeviceId(req);
+    try {
+      await requireApprovedDevice(adminUser.id, clientDeviceId);
+    } catch (deviceError) {
+      const message = deviceError instanceof Error ? deviceError.message : "Dispositivo não autorizado.";
       return forbidden(message, corsHeaders);
     }
 

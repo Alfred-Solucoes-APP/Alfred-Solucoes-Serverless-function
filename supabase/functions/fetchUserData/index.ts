@@ -3,6 +3,21 @@
 import { serve } from "std/http";
 import { createClient } from "supabase";
 import { Pool } from "postgres";
+import {
+  applyRateLimit,
+  buildCorsHeaders,
+  handlePreflight,
+  jsonResponse,
+  methodNotAllowed,
+  requireAuthenticatedUser,
+  serverError,
+  unauthorized,
+  forbidden,
+  getBearerToken,
+  getClientIp,
+  requireApprovedDevice,
+  getClientDeviceId,
+} from "../_shared/mod.ts";
 
 type PrimitiveType = "string" | "number" | "date" | "array" | "boolean";
 
@@ -668,70 +683,56 @@ function normalizeTableRecord(row: Record<string, unknown>): TableRecord {
 }
 
 serve(async (req: Request) => {
-  // CORS headers comuns
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": Deno.env.get("FUNCTIONS_ALLOWED_ORIGIN") ?? "*", // troque pelo domínio do frontend em produção se quiser mais seguro
-    "Access-Control-Allow-Headers":
-      "authorization, content-type, apikey, x-client-info, x-client-version",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
+  const corsHeaders = buildCorsHeaders({ methods: ["POST", "OPTIONS"] });
 
-  // Preflight OPTIONS
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders,
-    });
+  const preflight = handlePreflight(req, corsHeaders);
+  if (preflight) {
+    return preflight;
   }
 
   try {
     if (req.method !== "POST") {
-      return new Response("Method Not Allowed", {
-        status: 405,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/plain",
-        },
-      });
+      return methodNotAllowed(corsHeaders);
     }
 
-    // Autorização JWT
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Missing or invalid Authorization header" }), {
-        status: 401,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
-    }
-    const token = authHeader.substring("Bearer ".length);
+    const rateLimitResponse = applyRateLimit(req, corsHeaders, {
+      identifier: "fetchUserData",
+      max: 60,
+      windowMs: 60_000,
+      message: "Muitas requisições para carregar os dados. Tente novamente em instantes.",
+      keyGenerator: (request) => {
+        const ip = getClientIp(request);
+        const tokenFragment = getBearerToken(request)?.slice(-16) ?? "anon";
+        return `${ip}:${tokenFragment}`;
+      },
+    });
 
-    // Cliente para validar o token
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      {
-        global: {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-      }
-    );
-
-    const { data: userAuth, error: errAuth } = await supabaseClient.auth.getUser(token);
-    if (errAuth || !userAuth.user) {
-      return new Response(JSON.stringify({ error: "Invalid token or user not found" }), {
-        status: 401,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+    if (rateLimitResponse) {
+      return rateLimitResponse;
     }
-    const user_id = userAuth.user.id;
+
+    const token = getBearerToken(req);
+    if (!token) {
+      return unauthorized("Authorization header ausente.", corsHeaders);
+    }
+
+  let authUser: Awaited<ReturnType<typeof requireAuthenticatedUser>>;
+    try {
+      authUser = await requireAuthenticatedUser(token);
+    } catch (authError) {
+      const message = authError instanceof Error ? authError.message : "Usuário não autenticado.";
+      return unauthorized(message, corsHeaders);
+    }
+
+    const clientDeviceId = getClientDeviceId(req);
+    try {
+      await requireApprovedDevice(authUser.id, clientDeviceId);
+    } catch (deviceError) {
+      const message = deviceError instanceof Error ? deviceError.message : "Dispositivo não autorizado.";
+      return forbidden(message, corsHeaders);
+    }
+
+    const user_id = authUser.id;
 
     // Consulta master_db
     const supabaseMaster = createClient(
@@ -746,13 +747,7 @@ serve(async (req: Request) => {
       .single();
 
     if (errMaster || !userMasterRow) {
-      return new Response(JSON.stringify({ error: "User master record not found" }), {
-        status: 404,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ error: "User master record not found" }, { status: 404, corsHeaders });
     }
 
     const { db_host, db_name, db_user, db_password, company_name } = userMasterRow;
@@ -783,7 +778,7 @@ serve(async (req: Request) => {
         }
       }
 
-      const userRoles = extractUserRoles(userAuth.user);
+  const userRoles = extractUserRoles(authUser);
 
       const queryArgs: unknown[] = [];
       let baseQuery = `
@@ -1166,13 +1161,7 @@ serve(async (req: Request) => {
         tableErrors,
       };
 
-      return new Response(JSON.stringify(responsePayload), {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse(responsePayload, { status: 200, corsHeaders });
     } finally {
       client.release();
       await pool.end();
@@ -1180,15 +1169,7 @@ serve(async (req: Request) => {
 
   } catch (e) {
     console.error("Erro na função fetchUserData:", e);
-    return new Response(
-      JSON.stringify({ error: (e as Error).message }),
-      {
-        status: 500,
-        headers: {
-          "Content-Type": "application/json",
-          ...corsHeaders,
-        },
-      }
-    );
+    const message = e instanceof Error ? e.message : "Erro inesperado.";
+    return serverError(message, corsHeaders);
   }
 });

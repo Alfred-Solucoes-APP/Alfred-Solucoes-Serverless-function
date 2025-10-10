@@ -1,6 +1,23 @@
 import { serve } from "std/http";
 import { createClient } from "supabase";
 import { Pool } from "postgres";
+import {
+  applyRateLimit,
+  badRequest,
+  buildCorsHeaders,
+  handlePreflight,
+  jsonResponse,
+  methodNotAllowed,
+  notFound,
+  requireAuthenticatedUser,
+  serverError,
+  unauthorized,
+  getBearerToken,
+  getClientIp,
+  requireApprovedDevice,
+  getClientDeviceId,
+  forbidden,
+} from "../_shared/mod.ts";
 
 type ToggleRequestBody = {
   customer_id?: number | string;
@@ -53,64 +70,53 @@ function parseCustomerIdentifier(value: unknown): string | null {
 }
 
 serve(async (req: Request) => {
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": Deno.env.get("FUNCTIONS_ALLOWED_ORIGIN") ?? "*",
-    "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-client-info, x-client-version",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
+  const corsHeaders = buildCorsHeaders({ methods: ["POST", "OPTIONS"] });
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders,
-    });
+  const preflight = handlePreflight(req, corsHeaders);
+  if (preflight) {
+    return preflight;
   }
 
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405,
-      headers: {
-        ...corsHeaders,
-        "Content-Type": "application/json",
-      },
-    });
+    return methodNotAllowed(corsHeaders);
   }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Missing or invalid Authorization header" }), {
-        status: 401,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+    const rateLimitResponse = applyRateLimit(req, corsHeaders, {
+      identifier: "toggleCustomerPaused",
+      max: 10,
+      windowMs: 60_000,
+      message: "Muitas tentativas de alternar clientes. Aguarde um instante e tente novamente.",
+      keyGenerator: (request) => {
+        const ip = getClientIp(request);
+        const tokenFragment = getBearerToken(request)?.slice(-16) ?? "anon";
+        return `${ip}:${tokenFragment}`;
+      },
+    });
+
+    if (rateLimitResponse) {
+      return rateLimitResponse;
     }
 
-    const token = authHeader.substring("Bearer ".length);
+    const token = getBearerToken(req);
+    if (!token) {
+      return unauthorized("Missing or invalid Authorization header", corsHeaders);
+    }
 
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      {
-        global: {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-      },
-    );
+  let authUser: Awaited<ReturnType<typeof requireAuthenticatedUser>>;
+    try {
+      authUser = await requireAuthenticatedUser(token);
+    } catch (authError) {
+      const message = authError instanceof Error ? authError.message : "Usuário não autenticado.";
+      return unauthorized(message, corsHeaders);
+    }
 
-    const { data: userAuth, error: authError } = await supabaseClient.auth.getUser(token);
-    if (authError || !userAuth.user) {
-      return new Response(JSON.stringify({ error: "Invalid token or user not found" }), {
-        status: 401,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+    const clientDeviceId = getClientDeviceId(req);
+    try {
+      await requireApprovedDevice(authUser.id, clientDeviceId);
+    } catch (deviceError) {
+      const message = deviceError instanceof Error ? deviceError.message : "Dispositivo não autorizado.";
+      return forbidden(message, corsHeaders);
     }
 
     const supabaseMaster = createClient(
@@ -121,17 +127,11 @@ serve(async (req: Request) => {
     const { data: userMasterRow, error: masterError } = await supabaseMaster
       .from("db_info")
       .select("db_host, db_name, db_user, db_password")
-      .eq("id_user", userAuth.user.id)
+      .eq("id_user", authUser.id)
       .single();
 
     if (masterError || !userMasterRow) {
-      return new Response(JSON.stringify({ error: "Connection data not found" }), {
-        status: 404,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+      return notFound("Connection data not found", corsHeaders);
     }
 
     const { db_host, db_name, db_user, db_password } = userMasterRow;
@@ -148,13 +148,7 @@ serve(async (req: Request) => {
 
       const customerId = parseCustomerIdentifier(body.customer_id);
       if (customerId === null) {
-        return new Response(JSON.stringify({ error: "Parâmetro 'customer_id' inválido." }), {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+        return badRequest("Parâmetro 'customer_id' inválido.", corsHeaders);
       }
 
       const updateResult = await client.queryObject<{ id: number | string | null; paused: boolean | null }>({
@@ -168,13 +162,7 @@ serve(async (req: Request) => {
       });
 
       if (updateResult.rows.length === 0) {
-        return new Response(JSON.stringify({ error: "Cliente não encontrado." }), {
-          status: 404,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+        return notFound("Cliente não encontrado.", corsHeaders);
       }
 
       const [{ id, paused }] = updateResult.rows;
@@ -184,25 +172,14 @@ serve(async (req: Request) => {
         paused: Boolean(paused),
       };
 
-      return new Response(JSON.stringify(responseBody), {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse(responseBody, { status: 200, corsHeaders });
     } finally {
       client.release();
       await pool.end();
     }
   } catch (error) {
     console.error("toggleCustomerPaused: erro inesperado", error);
-    return new Response(JSON.stringify({ error: (error as Error).message ?? "Erro inesperado" }), {
-      status: 500,
-      headers: {
-        ...corsHeaders,
-        "Content-Type": "application/json",
-      },
-    });
+    const message = error instanceof Error ? error.message : "Erro inesperado";
+    return serverError(message, corsHeaders);
   }
 });
